@@ -8,3 +8,6 @@ langchain-community
 langchain-huggingface
 faiss-cpu
 sentence-transformers
+langchain.text_splitter
+langchain_community.vectorstores
+langchain_huggingface
