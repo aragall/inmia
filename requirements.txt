@@ -10,4 +10,5 @@ faiss-cpu
 sentence-transformers
 altair<5
 watchdog
-
+numpy<2
+pandas
