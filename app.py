@@ -4,6 +4,12 @@ from PIL import Image
 import os
 import google.generativeai as genai
 from typing import Optional
+import fitz  # PyMuPDF
+
+# RAG Dependencies
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 
 # Configure page settings
 st.set_page_config(
@@ -43,17 +49,20 @@ st.markdown("""
 # Initialize Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "chat_session" not in st.session_state:
-    st.session_state.chat_session = None
 if "estimated_price" not in st.session_state:
     st.session_state.estimated_price = None
+if "uploaded_image" not in st.session_state:
+    st.session_state.uploaded_image = None
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
 
+# --- Gemini Configuration ---
 def initialize_gemini(api_key: str):
     """Initialize the Gemini model."""
     try:
         genai.configure(api_key=api_key)
-        # Use a model that supports vision, e.g., gemini-1.5-flash or gemini-1.5-pro
-        model = genai.GenerativeModel('gemini-3-flash-preview')
+        # Use a model that supports vision
+        model = genai.GenerativeModel('gemini-3-flash-preview') 
         return model
     except Exception as e:
         st.error(f"Failed to initialize Gemini: {str(e)}")
@@ -67,17 +76,84 @@ def get_gemini_response(model, prompt_parts):
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
+# --- RAG Logic ---
+def process_pdf_rag(uploaded_file, hf_token):
+    """
+    Extracts text and images from PDF.
+    Creates a Vector Store (FAISS) with Hugging Face Embeddings for the text.
+    Returns: extracted_text (full), largest_image, vector_store
+    """
+    doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    text_content = ""
+    largest_image = None
+    max_area = 0
+
+    # 1. Extract Content (Text + Image)
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        text_content += page.get_text()
+        
+        # Extract images
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            try:
+                pil_image = Image.open(io.BytesIO(image_bytes))
+                width, height = pil_image.size
+                area = width * height
+                if area > max_area:
+                    max_area = area
+                    largest_image = pil_image
+            except Exception:
+                continue
+
+    # 2. Create Vector Store (RAG)
+    vector_store = None
+    if text_content and hf_token:
+        try:
+            # Split text into chunks
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = text_splitter.split_text(text_content)
+            
+            if chunks:
+                # Initialize HF Embeddings
+                # Using a standard lightweight model
+                embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2",
+                    model_kwargs={'device': 'cpu'},
+                    encode_kwargs={'normalize_embeddings': False},
+                    # Ensure token is used if required by specific closed models, 
+                    # but MiniLM is public. We pass it just in case or for private repos.
+                    # langchain_huggingface handles token via env or param if supported.
+                )
+                
+                # Create FAISS Vector Store
+                vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+        except Exception as e:
+            st.error(f"Failed to create Vector Store: {str(e)}")
+
+    return text_content, largest_image, vector_store
+
+def retrieve_context(vector_store, query):
+    """Retrieves relevant text chunks for a query."""
+    if not vector_store:
+        return ""
+    docs = vector_store.similarity_search(query, k=3)
+    return "\n".join([doc.page_content for doc in docs])
+
 # --- Sidebar Configuration ---
 with st.sidebar:
     st.title("🏠 Property Details")
     
-    # API Key Input
+    # API Keys
     api_key = st.text_input("Gemini API Key", type="password", help="Enter your Google Gemini API Key")
+    hf_token = st.text_input("Hugging Face Token", type="password", help="Enter your Hugging Face Token for RAG embeddings")
+
     if not api_key:
         api_key = os.getenv("GOOGLE_API_KEY") 
-        if not api_key:
-            st.warning("Please enter your API Key to proceed.")
-            
+
     st.divider()
     
     # Property Inputs
@@ -89,21 +165,61 @@ with st.sidebar:
     
     st.divider()
     
-    # Image Upload
-    plan_file = st.file_uploader("📂 Upload Cadastral Plan", type=["jpg", "jpeg", "png"])
+    # Image/PDF Upload
+    uploaded_file = st.file_uploader("📂 Upload Cadastral Plan (Image or PDF)", type=["jpg", "jpeg", "png", "pdf"])
 
 # --- Main Content ---
-st.title("🤖 Real Estate AI Appraiser")
-st.markdown("Upload a cadastral plan and provide details to get an AI-powered price estimation and analysis.")
+st.title("🤖 Real Estate AI Appraiser (RAG Enabled)")
+st.markdown("Upload a cadastral plan (Image or PDF) to get an AI-powered price estimation.")
 
-if api_key and plan_file:
-    # Display the uploaded image
-    image = Image.open(plan_file)
-    st.image(image, caption="Uploaded Cadastral Plan", use_column_width=True)
+if api_key and uploaded_file:
+    # Process the file
+    file_type = uploaded_file.type
     
-    # Configuration for analysis
+    if "pdf" in file_type:
+        if not hf_token:
+             st.warning("⚠️ Please provide a Hugging Face Token to enable RAG (Text Analysis). Processing image only for now.")
+        
+        # Only process if we haven't already or if it's a new file (simplified check)
+        # In a real app we'd check file_id. For now, button press triggers analysis.
+        pass
+    else:
+        # It's an image
+        image = Image.open(uploaded_file)
+        st.session_state.uploaded_image = image
+        st.session_state.vector_store = None # No text context for image upload
+
+    # --- UI Logic ---
     if st.button("💰 Estimate Price & Analyze"):
-        with st.spinner("Analyzing plan and market data..."):
+        with st.spinner("Processing & Analyzing..."):
+            
+            # 1. Handle PDF Processing (RAG) if needed
+            if "pdf" in file_type and not st.session_state.uploaded_image:
+                 text, img, v_store = process_pdf_rag(uploaded_file, hf_token)
+                 if img:
+                     st.session_state.uploaded_image = img
+                     st.session_state.vector_store = v_store
+                     st.success("✅ Extracted Cadastral Plan & Text from PDF.")
+                 else:
+                     st.error("❌ Could not find an image in the PDF.")
+                     st.stop()
+            elif "image" in file_type:
+                # Ensure image is loaded
+                 st.session_state.uploaded_image = Image.open(uploaded_file)
+            
+            # Display Image
+            st.image(st.session_state.uploaded_image, caption="Analyzed Plan", use_column_width=True)
+
+            # 2. Retrieve Context (RAG)
+            rag_context = ""
+            if st.session_state.vector_store:
+                # Query the vector store for relevant property details
+                query = f"property details surface area year built location price zoning {zone}"
+                rag_context = retrieve_context(st.session_state.vector_store, query)
+                with st.expander("� RAG Context (Retrieved from PDF)"):
+                    st.text(rag_context)
+
+            # 3. Gemini Analysis
             model = initialize_gemini(api_key)
             if model:
                 # Construct the prompt
@@ -117,7 +233,10 @@ if api_key and plan_file:
                     - Age: {age} years
                     - Surface Area: {surface_area} m²
                     - Condition: {condition}
-                    - Additional Notes: {additional_details}
+                    - Additional User Notes: {additional_details}
+                    
+                    Document Context (Retrieved via RAG):
+                    {rag_context}
                     
                     Please provide:
                     1. A realistic price estimation range based on the visual layout and details.
@@ -127,7 +246,7 @@ if api_key and plan_file:
                     
                     Format the output nicely in Markdown.
                     """,
-                    image
+                    st.session_state.uploaded_image
                 ]
                 
                 response_text = get_gemini_response(model, prompt)
@@ -135,59 +254,50 @@ if api_key and plan_file:
                 # Store text in session state for chat context
                 st.session_state.estimated_price = response_text
                 st.session_state.messages.append({"role": "assistant", "content": response_text})
-                
-                # Start a chat session with history if needed, for now we just append to messages
-                # For a true chat with history including the image, we'd need to maintain the history list for Gemini.
-                # Simplified: we just feed the last context in new prompts or trust the user refers to it.
-                # To keep it simple and stateless for the MVP, we will just use the chat interface below.
 
     # --- Result Display ---
     if st.session_state.estimated_price:
-        st.markdown("### 📊 Analysis Result")
         st.markdown(st.session_state.estimated_price)
         st.divider()
 
     # --- Chat Interface ---
     st.subheader("💬 Chat with your AI Agent")
 
-    # Display chat messages
+    # Display Chat History
     for message in st.session_state.messages:
-        # Skip the initial analysis if it's already displayed above? 
-        # Actually standard practice is to show it in chat or above. Let's show chat history.
-        if message["content"] != st.session_state.estimated_price: # visual cleanup, don't duplicate if we just showed it
+        if message["content"] != st.session_state.estimated_price: 
              with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # Chat input
+    # Chat Input
     if prompt := st.chat_input("Ask more about this property..."):
-        # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Generate response
         with st.spinner("Thinking..."):
             model = initialize_gemini(api_key)
-            if model:
-                # We need to send history. 
-                # Gemini support for history + images can be tricky in one-shot, but we can try sending text history.
-                # Best approach for "Chat with Image": send image + history every time or use start_chat if supported with images.
-                # Simple approach: Text-only follow up context + Image.
+            if model and st.session_state.uploaded_image:
                 
+                # Retrieve fresh RAG context for the specific question
+                current_rag_context = ""
+                if st.session_state.vector_store:
+                    current_rag_context = retrieve_context(st.session_state.vector_store, prompt)
+
                 history_prompt = [
-                    "You are a helpful Real Estate Assistant. Here is the context of our conversation so far:",
+                    "You are a helpful Real Estate Assistant. Answer using the chat history, image, and retrieved context.",
                     f"Initial Analysis: {st.session_state.estimated_price}",
+                    f"Relevant Document Context: {current_rag_context}"
                 ]
                 
-                # Add recent history (last 5 messages)
+                # Add recent history
                 for msg in st.session_state.messages[-5:]:
                     history_prompt.append(f"{msg['role'].upper()}: {msg['content']}")
                 
                 history_prompt.append(f"USER: {prompt}")
                 history_prompt.append("ASSISTANT:")
-                # We add the image again to ensure context is kept 
-                # (Gemini 1.5 Flash is cheap and fast, so re-sending image is okay for this demo)
-                final_input = [ "\n".join(history_prompt), image ]
+                
+                final_input = [ "\n".join(history_prompt), st.session_state.uploaded_image ]
                 
                 response = get_gemini_response(model, final_input)
                 
@@ -197,6 +307,6 @@ if api_key and plan_file:
 
 else:
     if not api_key:
-        st.info("👋 Please enter your Gemini API Key in the sidebar to start.")
-    if not plan_file:
-        st.info("👋 Please upload a cadastral plan image in the sidebar.")
+        st.info("👋 Please enter your Gemini API Key in the sidebar.")
+    if not uploaded_file:
+        st.info("👋 Please upload a cadastral plan (Image or PDF).")
