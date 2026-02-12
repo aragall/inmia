@@ -3,11 +3,11 @@ google-generativeai
 pillow
 python-dotenv
 pymupdf
-langchain
-langchain-community
+langchain==0.1.0
+langchain-community==0.0.10
 langchain-huggingface
 faiss-cpu
 sentence-transformers
-langchain.text_splitter
-langchain_community.vectorstores
-langchain_huggingface
+altair<5
+watchdog
+
